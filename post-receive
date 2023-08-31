@@ -1,0 +1,190 @@
+#!/usr/bin/python3
+
+import sys
+import subprocess
+from typing import List, Tuple, Set, Optional, Dict, Any
+import os
+import json
+import requests
+from pathlib import Path
+
+def die(*args: Any, **kwargs: Any) -> None:
+    """
+    Function to print to stderr and then exit with status code 1.
+
+    Parameters:
+        *args (Any): Variable length argument list.
+        **kwargs (Any): Arbitrary keyword arguments.
+    """
+    print(*args, file=sys.stderr, **kwargs)
+    exit(1)
+
+def get_git_config(key: str) -> str:
+    """
+    Retrieve the git configuration value for a given key.
+
+    Parameters:
+        key (str): The git configuration key to retrieve.
+
+    Returns:
+        str: The value of the git configuration key.
+    """
+    try:
+        value = subprocess.check_output(['git', 'config', '--get', key], text=True).strip()
+        return value
+    except subprocess.CalledProcessError:
+        return ''
+
+def read_token_from_file(file_path: str) -> str:
+    """
+    Read a token string from a file.
+
+    Parameters:
+        file_path (str): The path to the file containing the token.
+
+    Returns:
+        str: The token string read from the file.
+    """
+    try:
+        with open(file_path, 'r') as f:
+            return f.read().strip()
+    except FileNotFoundError:
+        die(f"Token file {file_path} not found.")
+
+def create_github_repo(token: str, repo_name: str, description: str, homepage: str, private: bool) -> Optional[str]:
+    """
+    Create a GitHub repository using the provided details.
+
+    Parameters:
+        token (str): The GitHub access token.
+        repo_name (str): The name of the repository to create.
+        description (str): The description of the repository.
+        homepage (str): The homepage URL for the repository.
+        private (bool): Whether the repository should be private.
+
+    Returns:
+        Optional[str]: The SSH URL of the created repository, or None if creation fails.
+    """
+    headers = {
+        'Accept': 'application/vnd.github+json',
+        'Authorization': f'Bearer {token}',
+        'X-GitHub-Api-Version': '2022-11-28'
+    }
+    payload = {
+        'name': repo_name,
+        'description': description,
+        'homepage': homepage,
+        'private': private,
+        'is_template': False  # Setting this to false as it's a mirror repo
+    }
+    url = 'https://api.github.com/user/repos'
+    response = requests.post(url, headers=headers, json=payload)
+    response_data: Dict[str, Any] = json.loads(response.text)
+    
+    if response.status_code != 201:
+        error_message = response_data.get('message', 'Unknown error')
+        die(f"Failed to create GitHub repo: {error_message}")
+    
+    return response_data.get('ssh_url')
+
+def configure_github_repo() -> str:
+    """
+    Configure a GitHub repository by retrieving token and other configuration settings from git config.
+
+    Returns:
+        str: The SSH URL of the configured repository.
+    """
+    token_file = get_git_config('automirror.gh-token-file')
+    if not token_file:
+        die("Token file not specified for GitHub integration.")
+    
+    token = read_token_from_file(token_file)
+    repo_name = os.environ.get('GL_REPO', '')  # Retrieve the repository name from the environment variable
+    if not repo_name:
+        die("GL_REPO environment variable not set.")
+    
+    description_template = get_git_config('automirror.gh-desc')
+    homepage_template = get_git_config('automirror.gh-homepage')
+    is_private_str = get_git_config('automirror.private')
+    is_private = is_private_str.lower() == 'true' if is_private_str else False
+
+    description = description_template.format(repo_name=repo_name)
+    homepage = homepage_template.format(repo_name=repo_name)
+
+    ssh_url = create_github_repo(token, repo_name, description, homepage, is_private)
+    if ssh_url:
+        subprocess.run(['git', 'config', '--local', '--add', 'automirror.remote', ssh_url])
+
+    return ssh_url
+
+def resolve_refs(ref_patterns: List[str]) -> Set[str]:
+    """
+    Resolve ref patterns into actual git refs.
+
+    Parameters:
+        ref_patterns (List[str]): The ref patterns to resolve.
+
+    Returns:
+        Set[str]: The set of resolved git refs.
+    """
+    # Use git for-each-ref to expand the ref pattern
+    resolve_refs = subprocess.check_output(
+        ['git', 'for-each-ref', "--format=%(refname)"] + ref_patterns, text=True
+    ).strip().split('\n')
+
+    return set(resolve_refs)
+
+def head_ref() -> str:
+    """
+    Retrieve the symbolic reference for the HEAD in the git repository.
+
+    Returns:
+        str: The HEAD ref in the repository.
+    """
+    ref = subprocess.check_output(['git', 'symbolic-ref', 'HEAD'], text=True)
+    return ref.strip()
+
+def git_push(remote_url: str, ref_spec: List[str]) -> None:
+    """
+    Push to the remote git repository.
+
+    Parameters:
+        remote_url (str): The URL of the remote repository.
+        ref_spec (List[str]): The ref specs to push.
+    """
+    ref_spec_args = [f'+{ref}:{ref}' for ref in ref_spec]
+    subprocess.run(['git', 'push'] + [remote_url] + ref_spec_args, check=True)
+
+def main() -> None:
+    """
+    Main function to execute the git automirror process.
+    """
+    remote_url = get_git_config('automirror.remote')
+    gh_create = get_git_config('automirror.gh-create') == 'true'
+
+    if gh_create and not remote_url:
+        remote_url = configure_github_repo()
+    elif not remote_url:
+        exit(0)
+
+    ref_spec_config = get_git_config('automirror.refs')
+    ref_spec_patterns = ref_spec_config.split(',') if ref_spec_config else [ head_ref() ]
+    resolved_ref_spec = resolve_refs(ref_spec_patterns)
+
+    # Collect updated refs from stdin
+    updated_refs = []
+    for line in sys.stdin:
+        old_sha1, new_sha1, refname = line.strip().split()
+        updated_refs.append(refname)
+
+    # Check if any of the updated refs are in the configured ref_spec
+    refs_to_push = [ref for ref in updated_refs if ref in resolved_ref_spec]
+
+    print('[post-receive] pushing refs to remote:', refs_to_push)
+
+    if refs_to_push:
+        git_push(remote_url, refs_to_push)
+
+if __name__ == '__main__':
+    main()
+
